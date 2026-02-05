@@ -1,5 +1,3 @@
-__pycache__/
-*.pyc
+node_modules/
 .env
-.pytest_cache/
-venv/
+temp/
