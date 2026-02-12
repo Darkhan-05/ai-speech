@@ -36,7 +36,9 @@ if (!GEMINI_API_KEY) {
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN, {
   telegram: {
     apiRoot: TELEGRAM_API_ROOT,
+    apiMode: 'bot',
   },
+  handlerTimeout: 600_000
 });
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const fileManager = new GoogleAIFileManager(GEMINI_API_KEY);
@@ -148,73 +150,124 @@ function validateSizeOrThrow(fileSize) {
 }
 
 async function downloadTelegramFile(ctx, meta) {
-  try {
-    const link = await ctx.telegram.getFileLink(meta.fileId);
-    const fileUrl = link.href || link.toString();
-    const tempPath = getTempFilePath(meta.fileName, fileUrl);
+  const maxAttempts = 6;
+  let attempt = 0;
 
-    const response = await axios.get(fileUrl, {
-      responseType: "stream",
-      timeout: 60_000,
-    });
+  while (attempt < maxAttempts) {
+    try {
+      const getFileUrl = `${TELEGRAM_API_ROOT}/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${meta.fileId}`;
+      const response = await axios.get(getFileUrl, { timeout: 300_000 });
 
-    const contentLength = Number(response.headers["content-length"] || 0);
-    if (contentLength > TELEGRAM_LIMIT_BYTES) {
-      response.data.destroy();
-      throw new StageError(
-        "Download",
-        `Файл слишком большой (${humanSize(contentLength)}). Стандартный лимит Telegram — 20 MB. Для файлов до 2 ГБ требуется локальный Bot API сервер.`,
-      );
+      if (response.data.ok) {
+        const internalPath = response.data.result.file_path;
+
+        // ВАЖНО: Мы заменяем путь контейнера на твой реальный путь на диске
+        const hostPath = internalPath.replace('/var/lib/telegram-bot-api', '/home/darkhan/tg-data');
+
+        console.log(`[Attempt ${attempt + 1}] Проверяю файл: ${hostPath}`);
+
+        if (fs.existsSync(hostPath)) {
+          const tempPath = getTempFilePath(meta.fileName, 'file://' + hostPath);
+          await fsp.copyFile(hostPath, tempPath);
+          console.log(`✅ Успех! Файл скопирован в: ${tempPath}`);
+          return tempPath;
+        } else {
+          console.log(`⏳ Файл еще качается сервером... (ждем 3 сек)`);
+        }
+      }
+    } catch (error) {
+      console.log(`❌ Ошибка запроса: ${error.message}`);
     }
 
-    await pipeline(response.data, fs.createWriteStream(tempPath));
-    return tempPath;
-  } catch (error) {
-    if (error instanceof StageError) {
-      throw error;
-    }
-    throw new StageError("Download", "Не удалось скачать файл.", error);
+    attempt++;
+    await new Promise(r => setTimeout(r, 3000));
   }
+
+  throw new StageError("Download", "Файл так и не появился на диске. Проверьте связь Docker с интернетом.");
 }
 
 async function processWithGemini(filePath, mimeType) {
   try {
-    // 1. Upload file to Gemini
+    console.log(`[Gemini] Проверка связи через Axios...`);
+
+    // Тест связи перед основной работой
+    try {
+      await axios.get('https://generativelanguage.googleapis.com/v1beta/models', {
+        params: { key: process.env.GEMINI_API_KEY },
+        timeout: 5000
+      });
+      console.log("✅ Axios успешно связался с Gemini API");
+    } catch (e) {
+      console.error("❌ Axios тоже не может достучаться:", e.message);
+      throw new Error(`Проблема с сетью (Axios): ${e.message}`);
+    }
+
+    console.log(`[Gemini] Начинаю загрузку файла: ${filePath} (${mimeType})`);
+
+    // 1. Загрузка файла через FileManager (библиотека Google)
+    // Добавляем принудительную задержку, чтобы файл точно "осел" на диске
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
     const uploadResponse = await fileManager.uploadFile(filePath, {
       mimeType,
       displayName: path.basename(filePath),
     });
 
-    // 2. Wait for processing (for small files it's usually instant, but good practice)
+    console.log(`[Gemini] Файл загружен, URI: ${uploadResponse.file.uri}`);
+
+    // 2. Ожидание обработки файла Google-ом
     let file = await fileManager.getFile(uploadResponse.file.name);
+    process.stdout.write("[Gemini] Обработка в облаке");
+
     while (file.state === "PROCESSING") {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      process.stdout.write(".");
+      await new Promise((resolve) => setTimeout(resolve, 2000));
       file = await fileManager.getFile(uploadResponse.file.name);
     }
 
+    console.log(`\n[Gemini] Статус завершен: ${file.state}`);
+
     if (file.state === "FAILED") {
-      throw new Error("File processing failed.");
+      throw new Error("Google AI не смог отрендерить файл (FAILED).");
     }
 
-    // 3. Generate content (transcription + analysis in one go)
-    const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
-    const result = await model.generateContent([
-      { text: SYSTEM_PROMPT },
-      {
-        fileData: {
-          mimeType: uploadResponse.file.mimeType,
-          fileUri: uploadResponse.file.uri,
-        },
-      },
-    ]);
+    // 3. Генерация контента
+    const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || "gemini-1.5-flash" });
 
-    const content = result.response.text();
-    if (!content) {
-      throw new Error("Пустой ответ от модели.");
-    }
-    return content.trim();
+    const generationConfig = {
+      temperature: 0.2, // Меньше креатива, больше точности
+      topP: 0.95,
+      maxOutputTokens: 8192,
+    };
+
+    const result = await model.generateContent({
+      contents: [{
+        role: 'user',
+        parts: [
+          { text: SYSTEM_PROMPT || "Сделай подробную транскрипцию и краткий пересказ этого видео/аудио." },
+          {
+            fileData: {
+              mimeType: uploadResponse.file.mimeType,
+              fileUri: uploadResponse.file.uri,
+            },
+          },
+        ],
+      }],
+      generationConfig,
+    });
+    const response = await result.response;
+    const text = response.text();
+    return text.trim();
   } catch (error) {
-    throw new StageError("Gemini", "Ошибка при обработке файла в Gemini.", error);
+    console.error("!!! КРИТИЧЕСКАЯ ОШИБКА GEMINI !!!");
+    console.error("- Сообщение:", error.message);
+
+    // Если это тот самый fetch failed, даем совет
+    if (error.message.includes('fetch failed')) {
+      console.error("👉 Совет: Попробуйте запустить с флагом: NODE_TLS_REJECT_UNAUTHORIZED=0");
+    }
+
+    throw new StageError("Gemini", "Ошибка при обработке в Google AI", error);
   }
 }
 
