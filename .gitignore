@@ -3,3 +3,6 @@ __pycache__/
 .env
 .pytest_cache/
 venv/
+node_modules/
+npm-debug.log
+package-lock.json
